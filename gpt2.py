@@ -18,15 +18,16 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd) # [query | key | value]
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
         self.n_head = config.n_head
+        self.n_embd = config.n_embd
         self.head_size = config.n_embd // config.n_head
         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                              .view(1,1,config.block_size, config.block_size),
                             persistent=False)
-        
+
     def forward(self, x):
         B,T,C = x.shape
         qkv = self.c_attn(x) # b,t,3c
-        q,k,v = qkv.split(config.n_embd, dim=-1) # b,t,c for each q,k,v
+        q,k,v = qkv.split(self.n_embd, dim=-1) # b,t,c for each q,k,v
         q = q.view(B, T, self.n_head, self.head_size).transpose(1,2) # b,nh,t,hs
         k = k.view(B, T, self.n_head, self.head_size).transpose(1,2) # b,nh,t,hs
         v = v.view(B, T, self.n_head, self.head_size).transpose(1,2) # b,nh,t,hs
@@ -52,6 +53,7 @@ class MLP(nn.Module):
         x = self.c_fc(x)
         x = self.gelu(x)
         x = self.c_proj(x)
+        return x
 
 class Block(nn.Module):
     def __init__(self, config):
@@ -62,13 +64,14 @@ class Block(nn.Module):
         self.mlp = MLP(config)
     
     def forward(self, x):
-        x = self.attn(self.ln_1(x)) + x
-        x = self.mlp(self.ln_2(x)) + x
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
         return x
 
 class GPT2(nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.config = config
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
@@ -76,6 +79,22 @@ class GPT2(nn.Module):
             ln_f = nn.LayerNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+    def forward(self, x):
+        B,T = x.shape
+        assert T <= self.config.block_size
+        pos = torch.arange(0, T, dtype=torch.long, device=x.device)
+        pos_emb = self.transformer.wpe(pos) # b,t,n_embd
+        tok_emb = self.transformer.wte(x) # b,t,n_embd
+        x = pos_emb + tok_emb
+
+        for block in self.transformer.h:
+            x = block(x)
+        # b,t,n_embd
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x) # b,t,vocab_size
+        return logits
+
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -122,3 +141,35 @@ class GPT2(nn.Module):
 
 model = GPT2.from_pretrained('gpt2')
 print(f'weights loaded form HF !')
+
+num_return_sequences = 5
+max_length = 30
+
+import tiktoken
+enc = tiktoken.get_encoding('gpt2')
+prompt = "Hi, I'm a language model,"
+input_ids = enc.encode(prompt) # (t,)
+input_ids = torch.tensor(input_ids, dtype=torch.long) # (t,)
+input_ids = input_ids.unsqueeze(0).repeat(num_return_sequences,1) # (b,t)
+# print(input_ids.shape)
+x = input_ids
+
+# generation
+# x: (5,8)
+while x.size(1) < max_length:
+    with torch.no_grad():
+        logits = model(x) # b,t,vocab_size
+        probs = F.softmax(logits[:, -1, :], dim=1) # b,vocab_size
+        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)        
+        # topk_probs: (b,50)
+        # topk_indices: (b,50)
+
+        ix = torch.multinomial(topk_probs, 1) # b,1
+        xcol = torch.gather(topk_indices, -1, ix) # b,1
+        x = torch.cat((x,xcol), dim=1) # b,t+1
+
+# decode and print text
+for i in range(num_return_sequences):
+    tokens = x[i].tolist()
+    decoded = enc.decode(tokens)
+    print(f'> {decoded}')
