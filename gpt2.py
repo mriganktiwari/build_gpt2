@@ -141,43 +141,53 @@ class GPT2(nn.Module):
         return model
 
 if __name__ == "__main__":
-    # config = GPTConfig()
-    # model = GPT2(config=config)
-    # for k,v in model.state_dict().items():
-    #     print(f'{k} --> {v.shape}')
-
-    model = GPT2.from_pretrained('gpt2')
-    print(f'weights loaded form HF !')
-    print(f'num of params: {sum(p.numel() for p in model.parameters()) / 1e6}')
-
-    num_return_sequences = 5
-    max_length = 30
+    import torch
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif torch.backends.mps.is_available():
+        device = "mps"
+    print(f'device = {device}')
 
     import tiktoken
-    enc = tiktoken.get_encoding('gpt2')
-    prompt = "Hi, I'm a language model,"
-    input_ids = enc.encode(prompt) # (t,)
-    input_ids = torch.tensor(input_ids, dtype=torch.long) # (t,)
-    input_ids = input_ids.unsqueeze(0).repeat(num_return_sequences,1) # (b,t)
-    # print(input_ids.shape)
-    x = input_ids
+    class DataLoader:
+        def __init__(self, B, T):
+            self.b = B
+            self.t = T
 
-    # generation
-    # x: (5,8)
-    while x.size(1) < max_length:
-        with torch.no_grad():
-            logits = model(x) # b,t,vocab_size
-            probs = F.softmax(logits[:, -1, :], dim=1) # b,vocab_size
-            topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)        
-            # topk_probs: (b,50)
-            # topk_indices: (b,50)
+            text = open('input.txt', 'r').read()
+            enc = tiktoken.get_encoding('gpt2')
+            tokens = enc.encode(text)
+            tokens = torch.tensor(tokens)
+            self.tokens = tokens
+            self.current_position = 0
 
-            ix = torch.multinomial(topk_probs, 1) # b,1
-            xcol = torch.gather(topk_indices, -1, ix) # b,1
-            x = torch.cat((x,xcol), dim=1) # b,t+1
+            print(f'loaded {len(self.tokens)} tokens')
+            print(f'1 epoch = {len(self.tokens) // (B*T)} batches')
 
-    # decode and print text
-    for i in range(num_return_sequences):
-        tokens = x[i].tolist()
-        decoded = enc.decode(tokens)
-        print(f'> {decoded}')
+        def next_batch(self):
+            B,T = self.b, self.t
+            buf = self.tokens[self.current_position : self.current_position + B*T + 1]
+            x = buf[:-1].view(B,T) # inputs
+            y = buf[1:].view(B,T) # targets
+            self.current_position += B*T
+            if self.current_position + (B*T + 1) > len(self.tokens):
+                self.current_position = 0
+            return x,y
+    
+    config = GPT2Config()
+    model = GPT2(config=config).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    train_loader = DataLoader(2,1024)
+
+    # training
+    max_steps = 101
+    for i in range(max_steps):
+        optimizer.zero_grad()
+        x,y = train_loader.next_batch()
+        x,y = x.to(device), y.to(device)
+        logits, loss = model(x, y)
+        loss.backward()
+        optimizer.step()
+        if i%100 == 0:
+            print(f'iteration: {i} --> loss: {loss.item()}')
