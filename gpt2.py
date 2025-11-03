@@ -5,7 +5,7 @@ import math
 from dataclasses import dataclass
 
 @dataclass
-class GPTConfig:
+class GPT2Config:
     vocab_size: int = 50257
     block_size: int = 1024
     n_embd: int = 768
@@ -40,7 +40,6 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1,2).contiguous().view(B,T,C) # b,t,c
         y = self.c_proj(y) # b,t,c -> b,t,c
         return y
-
 
 class MLP(nn.Module):
     def __init__(self, config):
@@ -79,8 +78,10 @@ class GPT2(nn.Module):
             ln_f = nn.LayerNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # weight tying
+        self.transformer.wte.weight = self.lm_head.weight
 
-    def forward(self, x):
+    def forward(self, x, target=None):
         B,T = x.shape
         assert T <= self.config.block_size
         pos = torch.arange(0, T, dtype=torch.long, device=x.device)
@@ -93,8 +94,13 @@ class GPT2(nn.Module):
         # b,t,n_embd
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x) # b,t,vocab_size
-        return logits
+        loss = None
+        if target is not None:
+            # logits: b,t,vocab_size --> b*t,vocab_size
+            # target: b,t -> b*t,
+            loss = F.cross_entropy(logits.view(B*T,logits.shape[-1]), target.view(B*T,))
 
+        return logits, loss
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -111,7 +117,7 @@ class GPT2(nn.Module):
         from transformers import GPT2LMHeadModel
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)
 
-        config = GPTConfig(**config_args)
+        config = GPT2Config(**config_args)
         model = GPT2(config=config)
 
         sd = model.state_dict()
@@ -134,42 +140,44 @@ class GPT2(nn.Module):
                     sd[k].copy_(sd_hf[k])
         return model
 
-# config = GPTConfig()
-# model = GPT2(config=config)
-# for k,v in model.state_dict().items():
-#     print(f'{k} --> {v.shape}')
+if __name__ == "__main__":
+    # config = GPTConfig()
+    # model = GPT2(config=config)
+    # for k,v in model.state_dict().items():
+    #     print(f'{k} --> {v.shape}')
 
-model = GPT2.from_pretrained('gpt2')
-print(f'weights loaded form HF !')
+    model = GPT2.from_pretrained('gpt2')
+    print(f'weights loaded form HF !')
+    print(f'num of params: {sum(p.numel() for p in model.parameters()) / 1e6}')
 
-num_return_sequences = 5
-max_length = 30
+    num_return_sequences = 5
+    max_length = 30
 
-import tiktoken
-enc = tiktoken.get_encoding('gpt2')
-prompt = "Hi, I'm a language model,"
-input_ids = enc.encode(prompt) # (t,)
-input_ids = torch.tensor(input_ids, dtype=torch.long) # (t,)
-input_ids = input_ids.unsqueeze(0).repeat(num_return_sequences,1) # (b,t)
-# print(input_ids.shape)
-x = input_ids
+    import tiktoken
+    enc = tiktoken.get_encoding('gpt2')
+    prompt = "Hi, I'm a language model,"
+    input_ids = enc.encode(prompt) # (t,)
+    input_ids = torch.tensor(input_ids, dtype=torch.long) # (t,)
+    input_ids = input_ids.unsqueeze(0).repeat(num_return_sequences,1) # (b,t)
+    # print(input_ids.shape)
+    x = input_ids
 
-# generation
-# x: (5,8)
-while x.size(1) < max_length:
-    with torch.no_grad():
-        logits = model(x) # b,t,vocab_size
-        probs = F.softmax(logits[:, -1, :], dim=1) # b,vocab_size
-        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)        
-        # topk_probs: (b,50)
-        # topk_indices: (b,50)
+    # generation
+    # x: (5,8)
+    while x.size(1) < max_length:
+        with torch.no_grad():
+            logits = model(x) # b,t,vocab_size
+            probs = F.softmax(logits[:, -1, :], dim=1) # b,vocab_size
+            topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)        
+            # topk_probs: (b,50)
+            # topk_indices: (b,50)
 
-        ix = torch.multinomial(topk_probs, 1) # b,1
-        xcol = torch.gather(topk_indices, -1, ix) # b,1
-        x = torch.cat((x,xcol), dim=1) # b,t+1
+            ix = torch.multinomial(topk_probs, 1) # b,1
+            xcol = torch.gather(topk_indices, -1, ix) # b,1
+            x = torch.cat((x,xcol), dim=1) # b,t+1
 
-# decode and print text
-for i in range(num_return_sequences):
-    tokens = x[i].tolist()
-    decoded = enc.decode(tokens)
-    print(f'> {decoded}')
+    # decode and print text
+    for i in range(num_return_sequences):
+        tokens = x[i].tolist()
+        decoded = enc.decode(tokens)
+        print(f'> {decoded}')
